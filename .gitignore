@@ -1,0 +1,34 @@
+/.idea/
+/vendor/
+/*.json
+/*.srs
+/*.db
+/site/
+/bin/
+/dist/
+/sing-box
+/sing-box.exe
+/build/
+/*.jar
+/*.aar
+/*.xcframework/
+/experimental/libbox/*.aar
+/experimental/libbox/*.xcframework/
+/experimental/libbox/*.nupkg
+.DS_Store
+/config.d/
+/venv/
+CLAUDE.md
+/.claude/
+
+# Build artifacts
+/*.dll
+/sing-box-*.exe
+
+# Go workspace (local paths, do not commit)
+go.work
+go.work.sum
+*.exe
+singbox.log
+*.exe~
+

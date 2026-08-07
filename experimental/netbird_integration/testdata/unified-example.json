@@ -1,0 +1,49 @@
+{
+  "sing_box": {
+    "log": {
+      "level": "info",
+      "output": "sing-box.log"
+    },
+    "dns": {
+      "servers": [
+        {
+          "tag": "local",
+          "address": "https://223.5.5.5/dns-query",
+          "detour": "direct"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "127.0.0.1",
+        "listen_port": 2080
+      },
+      {
+        "type": "tun",
+        "tag": "tun-in",
+        "interface_name": "singtun",
+        "inet4_address": "172.19.0.1/30",
+        "auto_route": true,
+        "strict_route": false
+      }
+    ],
+    "outbounds": [
+      { "type": "direct", "tag": "direct" },
+      { "type": "block", "tag": "block" },
+      { "type": "dns", "tag": "dns-out" }
+    ],
+    "route": {
+      "rules": [
+        { "protocol": "dns", "outbound": "dns-out" }
+      ],
+      "auto_detect_interface": true
+    }
+  },
+  "netbird": {
+    "device_name": "sing-netbird-windows",
+    "setup_key": "B28C0AA0-897D-45CC-8813-EE235CF3EFD5",
+    "management_url": "https://netbird.wangzhongwang.wang",
+    "log_level": "info"
+  }

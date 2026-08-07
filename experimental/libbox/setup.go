@@ -1,0 +1,242 @@
+package libbox
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"time"
+
+	"github.com/sagernet/sing-box/common/networkquality"
+	"github.com/sagernet/sing-box/common/stun"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/dns"
+	"github.com/sagernet/sing-box/experimental/locale"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/sagernet/sing/common/byteformats"
+	E "github.com/sagernet/sing/common/exceptions"
+)
+
+var (
+	sBasePath                string
+	sWorkingPath             string
+	sTempPath                string
+	sUserID                  int
+	sGroupID                 int
+	sFixAndroidStack         bool
+	sCommandServerListenPort uint16
+	sCommandServerSecret     string
+	sLogMaxLines             int
+	sDebug                   bool
+	sCrashReportSource       string
+	sOOMKillerEnabled        bool
+	sOOMKillerDisabled       bool
+	sOOMMemoryLimit          int64
+)
+
+func init() {
+	debug.SetPanicOnFault(true)
+	debug.SetTraceback("all")
+}
+
+type SetupOptions struct {
+	BasePath                string
+	WorkingPath             string
+	TempPath                string
+	FixAndroidStack         bool
+	CommandServerListenPort int32
+	CommandServerSecret     string
+	LogMaxLines             int
+	Debug                   bool
+	CrashReportSource       string
+	OomKillerEnabled        bool
+	OomKillerDisabled       bool
+	OomMemoryLimit          int64
+}
+
+func applySetupOptions(options *SetupOptions) {
+	sBasePath = options.BasePath
+	sWorkingPath = options.WorkingPath
+	sTempPath = options.TempPath
+
+	sUserID = os.Getuid()
+	sGroupID = os.Getgid()
+
+	// TODO: remove after fixed
+	// https://github.com/golang/go/issues/68760
+	sFixAndroidStack = options.FixAndroidStack
+
+	sCommandServerListenPort = uint16(options.CommandServerListenPort)
+	sCommandServerSecret = options.CommandServerSecret
+	sLogMaxLines = options.LogMaxLines
+	sDebug = options.Debug
+	sCrashReportSource = options.CrashReportSource
+	ReloadSetupOptions(options)
+}
+
+func ReloadSetupOptions(options *SetupOptions) {
+	sOOMKillerEnabled = options.OomKillerEnabled
+	sOOMKillerDisabled = options.OomKillerDisabled
+	sOOMMemoryLimit = options.OomMemoryLimit
+	if sOOMKillerEnabled {
+		if sOOMMemoryLimit == 0 && C.IsIos {
+			sOOMMemoryLimit = oomkiller.DefaultAppleNetworkExtensionMemoryLimit
+		}
+		if sOOMMemoryLimit > 0 {
+			debug.SetMemoryLimit(sOOMMemoryLimit * 3 / 4)
+		} else {
+			debug.SetMemoryLimit(math.MaxInt64)
+		}
+	} else {
+		debug.SetMemoryLimit(math.MaxInt64)
+	}
+}
+
+func Setup(options *SetupOptions) (err error) {
+	defer recoverError(&err)
+	applySetupOptions(options)
+	writeMarker("Setup ENTERED")
+	os.MkdirAll(sWorkingPath, 0o777)
+	os.MkdirAll(sTempPath, 0o777)
+	// ensure logs directory exists for writeMarker
+	_ = os.MkdirAll(filepath.Join(sBasePath, "logs"), 0o755)
+	return redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log"))
+}
+
+// writeMarker appends a timestamped line to the Go-side marker file.
+// The Kotlin side can read it for combined diagnostic view.
+func writeMarker(msg string) {
+	if sBasePath == "" {
+		return
+	}
+	p := filepath.Join(sBasePath, "logs", "go_markers.txt")
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[go-marker] %s\n", msg)
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "[%s] [go] %s\n", time.Now().Format("15:04:05.000"), msg)
+}
+
+func SetLocale(localeID string) error {
+	if !locale.Set(localeID) {
+		return E.New("unsupported locale: ", localeID)
+	}
+	return nil
+}
+
+func Version() string {
+	return C.Version
+}
+
+// SingBoxCommit returns the VCS revision (12 chars) of the sing-box build,
+// or "" when no build info is embedded (e.g. -buildvcs=false).
+func SingBoxCommit() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.revision" {
+			rev := setting.Value
+			if len(rev) > 12 {
+				rev = rev[:12]
+			}
+			return rev
+		}
+	}
+	return ""
+}
+
+// SingBoxBuildTime returns the VCS commit time (RFC3339) of the sing-box
+// build, or "" when no build info is embedded.
+func SingBoxBuildTime() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.time" {
+			return setting.Value
+		}
+	}
+	return ""
+}
+
+func GoVersion() string {
+	return runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH
+}
+
+func FormatBytes(length int64) string {
+	return byteformats.FormatKBytes(uint64(length))
+}
+
+func FormatMemoryBytes(length int64) string {
+	return byteformats.FormatMemoryKBytes(uint64(length))
+}
+
+func FormatDuration(duration int64) string {
+	return log.FormatDuration(time.Duration(duration) * time.Millisecond)
+}
+
+func FormatBitrate(bps int64) string {
+	return networkquality.FormatBitrate(bps)
+}
+
+const NetworkQualityDefaultConfigURL = networkquality.DefaultConfigURL
+
+const NetworkQualityDefaultMaxRuntimeSeconds = int32(networkquality.DefaultMaxRuntime / time.Second)
+
+const (
+	NetworkQualityAccuracyLow    = int32(networkquality.AccuracyLow)
+	NetworkQualityAccuracyMedium = int32(networkquality.AccuracyMedium)
+	NetworkQualityAccuracyHigh   = int32(networkquality.AccuracyHigh)
+)
+
+const (
+	NetworkQualityPhaseIdle     = int32(networkquality.PhaseIdle)
+	NetworkQualityPhaseDownload = int32(networkquality.PhaseDownload)
+	NetworkQualityPhaseUpload   = int32(networkquality.PhaseUpload)
+	NetworkQualityPhaseDone     = int32(networkquality.PhaseDone)
+)
+
+const STUNDefaultServer = stun.DefaultServer
+
+const (
+	STUNPhaseBinding      = int32(stun.PhaseBinding)
+	STUNPhaseNATMapping   = int32(stun.PhaseNATMapping)
+	STUNPhaseNATFiltering = int32(stun.PhaseNATFiltering)
+	STUNPhaseDone         = int32(stun.PhaseDone)
+)
+
+const (
+	NATMappingEndpointIndependent     = int32(stun.NATMappingEndpointIndependent)
+	NATMappingAddressDependent        = int32(stun.NATMappingAddressDependent)
+	NATMappingAddressAndPortDependent = int32(stun.NATMappingAddressAndPortDependent)
+)
+
+const (
+	NATFilteringEndpointIndependent     = int32(stun.NATFilteringEndpointIndependent)
+	NATFilteringAddressDependent        = int32(stun.NATFilteringAddressDependent)
+	NATFilteringAddressAndPortDependent = int32(stun.NATFilteringAddressAndPortDependent)
+)
+
+func FormatNATMapping(value int32) string {
+	return stun.NATMapping(value).String()
+}
+
+func FormatNATFiltering(value int32) string {
+	return stun.NATFiltering(value).String()
+}
+
+func FormatFQDN(fqdn string) string {
+	return dns.FqdnToDomain(fqdn)
+}
+
+func ProxyDisplayType(proxyType string) string {
+	return C.ProxyDisplayName(proxyType)
+}
