@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -170,10 +171,18 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if connIDDomain == "" {
 		connIDDomain = metadata.Destination.String()
 	}
-	// Extract process path for process-level tracking
+	// Extract process path for process-level tracking.
+	// Android searchers yield package names, not paths — fall back like the
+	// Clash API JSON (AndroidPackageNames[0]), then user id.
 	processPath := ""
 	if metadata.ProcessInfo != nil {
 		processPath = metadata.ProcessInfo.ProcessPath
+		if processPath == "" && len(metadata.ProcessInfo.AndroidPackageNames) > 0 {
+			processPath = metadata.ProcessInfo.AndroidPackageNames[0]
+		}
+		if processPath == "" && metadata.ProcessInfo.UserId != -1 {
+			processPath = strconv.FormatInt(int64(metadata.ProcessInfo.UserId), 10)
+		}
 	}
 	ctx = monitor.ContextWithDialMeta(ctx, &monitor.DialMeta{
 		ConnID:       fmt.Sprintf("%s-%d", connIDDomain, time.Now().UnixNano()),
@@ -314,10 +323,18 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if connIDDomain == "" {
 		connIDDomain = metadata.Destination.String()
 	}
-	// Extract process path for process-level tracking
+	// Extract process path for process-level tracking.
+	// Android searchers yield package names, not paths — fall back like the
+	// Clash API JSON (AndroidPackageNames[0]), then user id.
 	processPath := ""
 	if metadata.ProcessInfo != nil {
 		processPath = metadata.ProcessInfo.ProcessPath
+		if processPath == "" && len(metadata.ProcessInfo.AndroidPackageNames) > 0 {
+			processPath = metadata.ProcessInfo.AndroidPackageNames[0]
+		}
+		if processPath == "" && metadata.ProcessInfo.UserId != -1 {
+			processPath = strconv.FormatInt(int64(metadata.ProcessInfo.UserId), 10)
+		}
 	}
 	ctx = monitor.ContextWithDialMeta(ctx, &monitor.DialMeta{
 		ConnID:       fmt.Sprintf("%s-%d", connIDDomain, time.Now().UnixNano()),

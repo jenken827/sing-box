@@ -54,7 +54,16 @@ func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
 				DestIP:   meta.Metadata.Destination.String(),
 				ProcessPath: func() string {
 					if meta.Metadata.ProcessInfo != nil {
-						return meta.Metadata.ProcessInfo.ProcessPath
+						if meta.Metadata.ProcessInfo.ProcessPath != "" {
+							return meta.Metadata.ProcessInfo.ProcessPath
+						}
+						// Android searchers yield package names, not paths
+						if len(meta.Metadata.ProcessInfo.AndroidPackageNames) > 0 {
+							return meta.Metadata.ProcessInfo.AndroidPackageNames[0]
+						}
+						if meta.Metadata.ProcessInfo.UserId != -1 {
+							return strconv.Itoa(int(meta.Metadata.ProcessInfo.UserId))
+						}
 					}
 					return ""
 				}(),
