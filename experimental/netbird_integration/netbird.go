@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -23,6 +24,10 @@ type StartAllResult struct {
 	ModifiedConfig []byte
 	// Engine is the running netbird engine. nil if not started.
 	Engine *Engine
+	// NetworkCIDR is the account overlay CIDR from the sync response
+	// (e.g. "100.121.0.0/16"), or "" when unknown. Used by kernel-TUN mode
+	// to install the static route to wt0.
+	NetworkCIDR string
 }
 
 // StartAll starts the netbird engine, syncs with the management server,
@@ -44,11 +49,20 @@ func StartAll(cfg *Config, singBoxConfig []byte) (*StartAllResult, error) {
 		return result, nil
 	}
 
+	// Kernel-TUN mode is Linux-only: netbird creates a real kernel TUN (wt0)
+	// and a single static kernel route sends the overlay CIDR straight to it,
+	// bypassing the sing-box TUN stack (single TCP termination, official-app
+	// performance). Windows/Android keep the userspace netstack path.
+	kernelTun := cfg.KernelTun && runtime.GOOS == "linux"
+	SetKernelMode(kernelTun)
+	log.Info(fmt.Sprintf("netbird: data path: %s", map[bool]string{true: "kernel-tun (wt0)", false: "userspace netstack"}[kernelTun]))
+
 	t0 := time.Now()
 
 	engine := NewEngine(cfg)
 	if err := engine.Start(); err != nil {
 		log.Warn("netbird engine failed to start: ", err)
+		SetKernelMode(false)
 		result.ModifiedConfig = singBoxConfig
 		return result, nil // non-fatal: sing-box still runs
 	}
@@ -68,16 +82,37 @@ func StartAll(cfg *Config, singBoxConfig []byte) (*StartAllResult, error) {
 		} else {
 			customDomains = ExtractDomainsFromSync(resp)
 			networkCIDR = ExtractNetworkCIDR(resp)
+			result.NetworkCIDR = networkCIDR
 			// Compute the tunnel DNS server address from the account network
 			// (last-but-one IP of the overlay /16, e.g. 100.121.255.254:53).
 			// Without this, the netbird DNS transport has no reachable target.
-			SetDNSAddr(ComputeDNSAddr(networkCIDR))
+			// Netstack mode only: in kernel-TUN mode the DNS server binds the
+			// WG interface's own IP:53, set by SetupKernelRoute.
+			if !IsKernelMode() {
+				SetDNSAddr(ComputeDNSAddr(networkCIDR))
+			}
 			log.Info(fmt.Sprintf("netbird custom domains: %v, network: %s", customDomains, networkCIDR))
 		}
 	}
 	log.Info("netbird engine started")
 
-	modified, err := InjectNetbirdJSON(singBoxConfig, customDomains, networkCIDR)
+	// Start configured overlay→local TCP bridges (expose_ports).
+	// These must come after the engine + sync are up: BridgeTCP calls
+	// client.ListenTCP which needs a running engine with a netstack.
+	if len(cfg.ExposePorts) > 0 {
+		log.Infof("netbird: starting %d configured bridge(s)", len(cfg.ExposePorts))
+		for _, ep := range cfg.ExposePorts {
+			if ep.Port <= 0 || ep.Port > 65535 || ep.Target == "" {
+				log.Warnf("netbird: skipping invalid expose port config: %+v", ep)
+				continue
+			}
+			if _, err := BridgeTCP(ep.Port, ep.Target); err != nil {
+				log.Warnf("netbird: bridge :%d → %s failed: %v", ep.Port, ep.Target, err)
+			}
+		}
+	}
+
+	modified, err := InjectNetbirdJSON(singBoxConfig, customDomains, networkCIDR, cfg.ManagementURL)
 	if err != nil {
 		// Non-fatal: sing-box still runs, just without netbird rules
 		log.Warn("inject netbird config: ", err)
@@ -106,6 +141,30 @@ type Config struct {
 	AdminURL      string `json:"admin_url"`
 	LogLevel      string `json:"log_level"`
 	DataDir       string `json:"data_dir"`
+	// KernelTun enables the Linux kernel-TUN data path (Route A):
+	// netbird creates a real kernel TUN (wt0) and a single static kernel
+	// route sends the overlay CIDR directly to it, bypassing the sing-box
+	// TUN stack. Only honored on Linux; Windows/Android always use the
+	// userspace netstack path. Requires root.
+	KernelTun bool `json:"kernel_tun"`
+	// PrivateKey authenticates as an existing device (direct key auth),
+	// e.g. to reuse a running netbird daemon's identity during migration.
+	// Mutually exclusive with SetupKey/JWTToken.
+	PrivateKey string `json:"private_key"`
+	// ExposePorts lists overlay→local TCP port forwards. Each entry makes
+	// the netbird engine listen on the given port inside the overlay
+	// (netstack) and forward accepted connections to the local target.
+	// Needed because the userspace netstack cannot deliver inbound
+	// connections to processes listening on the host kernel stack.
+	ExposePorts []ExposePortConfig `json:"expose_ports"`
+}
+
+// ExposePortConfig declares one overlay→local TCP forward.
+type ExposePortConfig struct {
+	// Port is the port to listen on inside the netbird overlay.
+	Port int `json:"port"`
+	// Target is the local host:port to forward to (e.g. "127.0.0.1:8022").
+	Target string `json:"target"`
 }
 
 // Status represents engine status.
@@ -149,20 +208,25 @@ func (e *Engine) Start() error {
 	// Fall back to env vars for credentials if not in config
 	setupKey := e.cfg.SetupKey
 	jwtToken := e.cfg.JWTToken
+	privateKey := e.cfg.PrivateKey
 	if setupKey == "" {
 		setupKey = os.Getenv("NB_SETUP_KEY")
 	}
 	if jwtToken == "" {
 		jwtToken = os.Getenv("NB_JWT_TOKEN")
 	}
-	if setupKey == "" && jwtToken == "" {
-		log.Warn("netbird: no SetupKey or JWTToken set, engine may not authenticate")
+	if privateKey == "" {
+		privateKey = os.Getenv("NB_PRIVATE_KEY")
+	}
+	if setupKey == "" && jwtToken == "" && privateKey == "" {
+		log.Warn("netbird: no SetupKey, JWTToken or PrivateKey set, engine may not authenticate")
 	}
 
 	opts := nbembed.Options{
 		DeviceName:    e.cfg.DeviceName,
 		SetupKey:      setupKey,
 		JWTToken:      jwtToken,
+		PrivateKey:    privateKey,
 		ManagementURL: e.cfg.ManagementURL,
 		LogLevel:      e.cfg.LogLevel,
 	}
@@ -172,6 +236,32 @@ func (e *Engine) Start() error {
 	os.MkdirAll(stateDir, 0700)
 	opts.ConfigPath = filepath.Join(stateDir, "config.json")
 	opts.StatePath = filepath.Join(stateDir, "state.json")
+	// Send netbird engine logs to DataDir/nb-engine.log so relay/P2P
+	// paths, peer states and bridge failures are diagnosable. The default
+	// os.Stderr sink is swallowed by gomobile/libbox on Android.
+	if logFile, err := os.OpenFile(
+		filepath.Join(e.cfg.DataDir, "nb-engine.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600,
+	); err == nil {
+		opts.LogOutput = logFile
+		log.Info("netbird: engine logs → " + filepath.Join(e.cfg.DataDir, "nb-engine.log"))
+	} else {
+		log.Warn("netbird: open nb-engine.log: ", err)
+	}
+
+	// Kernel-TUN mode (Linux only): real kernel TUN + no netbird-managed
+	// routes. The embed Options expose NoUserspace and DisableClientRoutes;
+	// DisableDNS/DisableFirewall are not exposed, so they are pre-seeded
+	// into netbird's profile config file (profilemanager preserves file
+	// values when the corresponding ConfigInput pointers are nil).
+	kernelTun := e.cfg.KernelTun && runtime.GOOS == "linux"
+	if kernelTun {
+		opts.NoUserspace = true
+		opts.DisableClientRoutes = true
+		if err := writeNetbirdProfileConfig(opts.ConfigPath); err != nil {
+			log.Warn("netbird: pre-write profile config: ", err)
+		}
+	}
 
 	client, err := nbembed.New(opts)
 	if err != nil {
@@ -197,6 +287,7 @@ func (e *Engine) Start() error {
 func (e *Engine) Stop() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	defer SetKernelMode(false)
 
 	if !e.running || e.client == nil {
 		return nil
@@ -264,4 +355,27 @@ func ReadUnifiedConfig(path string) (*UnifiedConfig, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	return &cfg, nil
+}
+
+// writeNetbirdProfileConfig pre-seeds netbird's own profile config file
+// (nb-state/config.json) with the settings embed Options cannot express:
+// DisableDNS (don't touch /etc/resolv.conf) and DisableFirewall (don't
+// engage nftables). Existing keys are preserved — the file is read, patched
+// and written back so a previously persisted PrivateKey survives.
+func writeNetbirdProfileConfig(path string) error {
+	cfg := make(map[string]any)
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &cfg) // tolerate partial/corrupt files
+	}
+	cfg["DisableDNS"] = true
+	cfg["DisableFirewall"] = true
+	cfg["DisableClientRoutes"] = true
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
 }

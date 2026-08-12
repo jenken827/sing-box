@@ -109,7 +109,7 @@ func TestInjectNetbirdJSONNetworkCIDR(t *testing.T) {
 	raw := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}`)
 
 	// 动态网段生效, 且规则插在最前
-	out, err := InjectNetbirdJSON(raw, nil, "100.90.0.0/16")
+	out, err := InjectNetbirdJSON(raw, nil, "100.90.0.0/16", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,17 +118,27 @@ func TestInjectNetbirdJSONNetworkCIDR(t *testing.T) {
 		t.Fatal(err)
 	}
 	rules, _ := m["route"].(map[string]any)["rules"].([]any)
-	first, _ := rules[0].(map[string]any)
-	cidrs, _ := first["ip_cidr"].([]any)
-	if len(cidrs) != 1 || cidrs[0] != "100.90.0.0/16" {
-		t.Fatalf("dynamic cidr not applied: %v", cidrs)
+	// 首条是引擎 bypass(process_path),overlay 规则在其后
+	if _, ok := rules[0].(map[string]any)["process_path"]; !ok {
+		t.Fatalf("first rule is not the engine bypass: %v", rules[0])
 	}
-	if first["outbound"] != "nb-out" {
-		t.Fatalf("outbound not nb-out: %v", first["outbound"])
+	foundCIDR := false
+	for _, r := range rules {
+		rule, _ := r.(map[string]any)
+		cidrs, _ := rule["ip_cidr"].([]any)
+		if len(cidrs) == 1 && cidrs[0] == "100.90.0.0/16" {
+			foundCIDR = true
+			if rule["outbound"] != "nb-out" {
+				t.Fatalf("overlay rule outbound not nb-out: %v", rule["outbound"])
+			}
+		}
+	}
+	if !foundCIDR {
+		t.Fatalf("dynamic cidr not applied: %v", rules)
 	}
 
 	// 空网段回退默认
-	out2, err := InjectNetbirdJSON(raw, nil, "")
+	out2, err := InjectNetbirdJSON(raw, nil, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
