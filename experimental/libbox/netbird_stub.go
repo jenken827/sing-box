@@ -8,3 +8,6 @@ import E "github.com/sagernet/sing/common/exceptions"
 func NetbirdStartAll(netbirdConfigJSON string, singBoxConfig string) (string, error) {
 	return singBoxConfig, E.New("netbird not compiled in (build without with_netbird tag)")
 }
+
+// NetbirdStop — stub when netbird is not compiled in.
+func NetbirdStop() {}

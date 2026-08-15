@@ -87,8 +87,10 @@ fi
 
 # ── Build flags ─────────────────────────────────────────────────────
 LD_VERSION="-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}'"
-# netbird: report the version we ACTUALLY compiled (exact-match tag only,
-# otherwise "development" — never lie about which tag's code we used).
+# netbird: report our declared upstream baseline — read from the netbird
+# repo's UPSTREAM_TAG file (like sing-box), fall back to exact-match
+# describe, then "development". Commit hash is injected separately, so the
+# displayed "Netbird: <tag> (<commit>)" stays verifiable.
 if [ "$WITH_NETBIRD" = true ]; then
     # netbird 仓库定位: 环境变量优先; 否则只在 sing-box 仓库上一层目录查找
     # (仓库约定平级放在同一父目录下, 如 ~/works/{sing-box,netbird})。
@@ -108,13 +110,22 @@ if [ "$WITH_NETBIRD" = true ]; then
             exit 1
         fi
     fi
-    NETBIRD_VERSION="$(cd "$NETBIRD_DIR" && git describe --tags --exact-match 2>/dev/null || echo development)"
+    NETBIRD_VERSION="$(cd "$NETBIRD_DIR" && cat UPSTREAM_TAG 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "${NETBIRD_VERSION:-}" ]; then
+        NETBIRD_VERSION="$(cd "$NETBIRD_DIR" && git describe --tags --exact-match 2>/dev/null || echo development)"
+    fi
     NETBIRD_COMMIT="$(cd "$NETBIRD_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     LD_VERSION="${LD_VERSION} -X 'github.com/netbirdio/netbird/version.version=${NETBIRD_VERSION}'"
     # main package vars use "main." prefix (full import path does not match in link)
     LD_VERSION="${LD_VERSION} -X 'main.netbirdBuildCommit=${NETBIRD_COMMIT}'"
-    echo "  netbird version: ${NETBIRD_VERSION} (exact-match, commit ${NETBIRD_COMMIT})"
+    echo "  netbird version: ${NETBIRD_VERSION} (UPSTREAM_TAG, commit ${NETBIRD_COMMIT})"
 fi
+
+# Real build time for About. Without injection SingBoxBuildTime() falls back
+# to the VCS commit time embedded by Go (the commit timestamp, not the build
+# time). Injected on both the binary and the libbox (Android) builds.
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LD_VERSION="${LD_VERSION} -X 'github.com/sagernet/sing-box/experimental/libbox.singBoxBuildTime=${BUILD_TIME}'"
 
 if [ "$BUILD_MODE" = "release" ]; then
     LDFLAGS_SHARED="${LD_VERSION} -s -w -buildid="

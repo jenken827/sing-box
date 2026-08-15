@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"net"
 	"net/netip"
-	"strings"
 	"testing"
 
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
@@ -105,11 +104,13 @@ func TestComputeDNSAddrMatchesNetbird(t *testing.T) {
 	}
 }
 
-func TestInjectNetbirdJSONNetworkCIDR(t *testing.T) {
+// TestInjectNetbirdJSONNoStaticCIDR: overlay 网段路由不再以静态 ip_cidr
+// 规则注入(由 nb-cidr rule-set 文件承载, StartAll 写默认/持久化值, 引擎
+// sync 后重写) — 注入结果中不得出现任何 ip_cidr overlay 规则。
+func TestInjectNetbirdJSONNoStaticCIDR(t *testing.T) {
 	raw := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}`)
 
-	// 动态网段生效, 且规则插在最前
-	out, err := InjectNetbirdJSON(raw, nil, "100.90.0.0/16", "")
+	out, err := InjectNetbirdJSON(raw, "", nil, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,31 +119,18 @@ func TestInjectNetbirdJSONNetworkCIDR(t *testing.T) {
 		t.Fatal(err)
 	}
 	rules, _ := m["route"].(map[string]any)["rules"].([]any)
-	// 首条是引擎 bypass(process_path),overlay 规则在其后
-	if _, ok := rules[0].(map[string]any)["process_path"]; !ok {
+	if len(rules) == 0 {
+		t.Fatal("no rules injected")
+	}
+	// 首条是引擎 bypass(direct 旁路)
+	first, _ := rules[0].(map[string]any)
+	if first["outbound"] != "direct" {
 		t.Fatalf("first rule is not the engine bypass: %v", rules[0])
 	}
-	foundCIDR := false
+	// 不得注入静态 ip_cidr overlay 规则
 	for _, r := range rules {
-		rule, _ := r.(map[string]any)
-		cidrs, _ := rule["ip_cidr"].([]any)
-		if len(cidrs) == 1 && cidrs[0] == "100.90.0.0/16" {
-			foundCIDR = true
-			if rule["outbound"] != "nb-out" {
-				t.Fatalf("overlay rule outbound not nb-out: %v", rule["outbound"])
-			}
+		if _, ok := r.(map[string]any)["ip_cidr"]; ok {
+			t.Fatalf("static ip_cidr rule must not be injected (nb-cidr rule-set replaces it): %v", r)
 		}
-	}
-	if !foundCIDR {
-		t.Fatalf("dynamic cidr not applied: %v", rules)
-	}
-
-	// 空网段回退默认
-	out2, err := InjectNetbirdJSON(raw, nil, "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(out2), "100.121.0.0/16") {
-		t.Fatalf("default fallback missing: %s", out2)
 	}
 }

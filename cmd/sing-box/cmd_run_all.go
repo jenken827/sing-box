@@ -100,6 +100,7 @@ func runAll() error {
 func runAllEngines(cfgPath string) (func(), error) {
 	t0 := time.Now()
 	var nbEngine *netbird_integration.Engine
+	var startAllResult *netbird_integration.StartAllResult
 
 	if runAllEnableNetbird {
 		nbCfg := buildNetbirdConfig(cfgPath)
@@ -108,15 +109,15 @@ func runAllEngines(cfgPath string) (func(), error) {
 			log.Warn("read config: ", err)
 			return nil, nil
 		}
-		result, err := netbird_integration.StartAll(nbCfg, rawConfig)
+		startAllResult, err = netbird_integration.StartAll(nbCfg, rawConfig)
 		if err != nil {
 			log.Warn("netbird start: ", err)
 		}
-		if result != nil {
-			nbEngine = result.Engine
-			if result.ModifiedConfig != nil {
+		if startAllResult != nil {
+			nbEngine = startAllResult.Engine
+			if startAllResult.ModifiedConfig != nil {
 				tmpPath := cfgPath + ".nb-tmp.json"
-				if err := os.WriteFile(tmpPath, result.ModifiedConfig, 0644); err != nil {
+				if err := os.WriteFile(tmpPath, startAllResult.ModifiedConfig, 0644); err != nil {
 					return nil, E.Cause(err, "write temp config")
 				}
 				defer os.Remove(tmpPath)
@@ -150,7 +151,26 @@ func runAllEngines(cfgPath string) (func(), error) {
 	_ = instance
 	log.Info(fmt.Sprintf("sing-box started (t=%.1fs)", time.Since(t1).Seconds()))
 
+	// Kernel-TUN mode: install the single static overlay → wt0 route so
+	// netbird traffic bypasses the sing-box TUN stack. Our rule priority
+	// (2000) always precedes sing-tun's (9000), so ordering vs the TUN
+	// setup above does not matter. Non-fatal on failure: sing-box still
+	// runs and overlay traffic falls back to the TUN path (degraded).
+	var kernelRouteCleanup func()
+	if nbEngine != nil && startAllResult != nil && netbird_integration.IsKernelMode() {
+		kernelRouteCleanup, err = netbird_integration.SetupKernelRoute(startAllResult.NetworkCIDR)
+		if err != nil {
+			log.Warn("netbird kernel route: ", err)
+		} else {
+			log.Info(fmt.Sprintf("netbird kernel route installed (overlay → wt0, t=%.1fs)", time.Since(t0).Seconds()))
+		}
+	}
+
 	cleanup := func() {
+		if kernelRouteCleanup != nil {
+			kernelRouteCleanup()
+			log.Info("netbird kernel route removed")
+		}
 		if nbEngine != nil {
 			if err := nbEngine.Stop(); err != nil {
 				log.Error("netbird stop: ", err)
@@ -198,6 +218,12 @@ func buildNetbirdConfig(cfgPath string) *netbird_integration.Config {
 		}
 		if fileCfg.LogLevel != "" {
 			cfg.LogLevel = fileCfg.LogLevel
+		}
+		if fileCfg.KernelTun {
+			cfg.KernelTun = true
+		}
+		if fileCfg.PrivateKey != "" {
+			cfg.PrivateKey = fileCfg.PrivateKey
 		}
 	}
 	return cfg

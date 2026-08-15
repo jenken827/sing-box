@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -19,7 +18,6 @@ import (
 const OutboundType = "netbird"
 
 func RegisterOutbound(registry *outbound.Registry) {
-	fmt.Fprintf(os.Stderr, "[nb-out] RegisterOutbound called\n")
 	outbound.Register[NetbirdOutboundOptions](registry, OutboundType, NewOutbound)
 }
 
@@ -35,7 +33,6 @@ type Outbound struct {
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options NetbirdOutboundOptions) (adapter.Outbound, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	fmt.Fprintf(os.Stderr, "[nb-out] NewOutbound tag=%s\n", tag)
 	return &Outbound{
 		Adapter: outbound.NewAdapter(OutboundType, tag, []string{"tcp", "udp"}, nil),
 		ctx:     ctx,
@@ -44,10 +41,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 }
 
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	client := GetClient()
-	if client == nil {
-		return nil, context.Canceled
-	}
 	// Use Fqdn if available (proxy CONNECT requests route by domain, not IP)
 	var addr string
 	if destination.Fqdn != "" {
@@ -55,17 +48,28 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 	} else {
 		addr = net.JoinHostPort(destination.Addr.String(), strconv.Itoa(int(destination.Port)))
 	}
-	fmt.Fprintf(os.Stderr, "[nb-out] DialContext network=%s addr=%s\n", network, addr)
-	conn, err := client.DialContext(ctx, network, addr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[nb-out] FAILED: %v\n", err)
-		return nil, err
+	// Kernel-TUN mode: no wgnetstack (client.DialContext is unavailable).
+	// Dial via the host stack — the kernel routes the overlay destination
+	// straight to wt0. This outbound is normally unused in kernel mode
+	// (no route rules are injected), it is a defensive fallback.
+	if IsKernelMode() {
+		dialer := &net.Dialer{}
+		return dialer.DialContext(ctx, network, addr)
 	}
-	fmt.Fprintf(os.Stderr, "[nb-out] SUCCESS addr=%s\n", addr)
-	return conn, nil
+	client := GetClient()
+	if client == nil {
+		return nil, context.Canceled
+	}
+	return client.DialContext(ctx, network, addr)
 }
 
 func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	// Kernel-TUN mode has no wgnetstack; UDP to the overlay is handled by
+	// the kernel route (wt0). This outbound is not selected in kernel mode
+	// since no route rules are injected.
+	if IsKernelMode() {
+		return nil, fmt.Errorf("netbird outbound: ListenPacket unavailable in kernel-tun mode")
+	}
 	client := GetClient()
 	if client == nil {
 		return nil, context.Canceled

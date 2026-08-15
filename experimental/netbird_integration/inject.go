@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
-	"strings"
 )
 
 // kernelMode selects the Linux kernel-TUN data path (Route A):
@@ -25,18 +23,40 @@ func IsKernelMode() bool { return kernelMode }
 // SetKernelMode records whether the kernel-TUN data path is active.
 func SetKernelMode(v bool) { kernelMode = v }
 
+// Rule-set tags referencing the local custom-domain / overlay-CIDR files.
+// They are SEPARATE sets: the DNS rule references only the domain set — a
+// DNS-referenced rule-set carrying ip_cidr rules is rejected by sing-box 1.14
+// ("Legacy Address Filter Fields in DNS rules is deprecated", see
+// writeDomainsRuleSet). The CIDR set is referenced by route rules only.
+const customRuleSetTag = "nb-domains"
+const customCIDRRuleSetTag = "nb-cidr"
+
 // InjectNetbirdJSON adds netbird DNS server, outbound, route/rule-set entries,
 // and the engine-traffic bypass to the raw sing-box config. It returns the
 // modified JSON bytes.
 //
-// customDomains (from netbird SyncResponse) get domain-specific route and DNS
-// rules pointing to the netbird outbound/DNS server so they resolve through
-// the netbird tunnel.
-// networkCIDR (from netbird SyncResponse, e.g. "100.121.0.0/16") is the
-// account's overlay subnet and is always routed through netbird; empty falls
-// back to the netbird default 100.121.0.0/16.
+// Custom domains are NOT baked into per-domain rules: the config declares two
+// local rule-sets and route/DNS rules reference them:
+//   - nb-domains (file at ruleSetPath): domain_suffix list, referenced by the
+//     DNS rule (server nb) and the route rule (outbound nb-out)
+//   - nb-cidr (file at cidrRuleSetPath): the overlay CIDR, referenced by the
+//     route rule only (DNS rules must not reference IP-bearing sets)
+// The integration rewrites these files whenever the engine syncs; sing-box
+// reloads the rule-sets at runtime (fswatch), so domains/CIDR arriving after
+// startup (engine recovery) take effect without reloading the service. Both
+// files must exist when the config loads (StartAll writes them, possibly
+// empty/default, before returning). Empty ruleSetPath skips the rule-set
+// machinery entirely (no custom-domain rules injected).
+//
 // mgmtURL is the netbird management URL (netbird-config.json management_url);
 // its host — together with netbird.io — feeds the engine-traffic bypass rules.
+// ctlIPs are the engine's control-plane server IPs (management/STUN/TURN/
+// relay hosts, resolved from mgmtURL by the caller). They get an explicit
+// ip_cidr → direct rule: remote rule-sets (geoip/geosite) are downloaded
+// asynchronously and may not be loaded when the engine performs its first
+// STUN probes at startup — without an explicit IP rule those probes fall
+// through to `final` (usually the proxy) and the srflx candidate comes back
+// poisoned with the proxy exit IP, breaking P2P until a restart.
 //
 // Engine-traffic bypass (BOTH kernel-TUN and userspace paths): the netbird
 // engine's own sockets (STUN / management / relay / TURN / wg probes) are
@@ -56,7 +76,7 @@ func SetKernelMode(v bool) { kernelMode = v }
 //          DNS must not go through dns-remote → proxy: 200-430ms → 58ms)
 // All injections are idempotent: matching rules already present in the config
 // (e.g. hand-edited) are kept and not duplicated.
-func InjectNetbirdJSON(rawData []byte, customDomains []string, networkCIDR string, mgmtURL string) ([]byte, error) {
+func InjectNetbirdJSON(rawData []byte, mgmtURL string, ctlIPs []string, ruleSetPath string, cidrRuleSetPath string) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(rawData, &raw); err != nil {
 		return nil, err
@@ -112,13 +132,14 @@ func InjectNetbirdJSON(rawData []byte, customDomains []string, networkCIDR strin
 
 	// Engine-traffic bypass — prepended so it always wins over proxy rules.
 	prepended := []any{}
-	if exe, err := os.Executable(); err == nil && exe != "" {
-		if !hasProcessPathRule(cleaned, exe) {
-			prepended = append(prepended, map[string]any{
-				"process_path": []string{exe},
-				"outbound":     "direct",
-			})
-		}
+	// Control-plane IPs → direct. Must not depend on geoip/geosite rule-sets:
+	// they load asynchronously and are often not ready when the engine does
+	// its first STUN probes (StartAll runs before sing-box is created).
+	if len(ctlIPs) > 0 && !hasIPDirectRule(cleaned, ctlIPs) {
+		prepended = append(prepended, map[string]any{
+			"ip_cidr":  ctlIPs,
+			"outbound": "direct",
+		})
 	}
 	if !hasDomainDirectRule(cleaned, ctlDomains) {
 		prepended = append(prepended, map[string]any{
@@ -149,36 +170,81 @@ func InjectNetbirdJSON(rawData []byte, customDomains []string, networkCIDR strin
 			raw["outbounds"] = outbounds
 		}
 
-		// Netbird internal IP range — always route through netbird outbound
-		// (dynamic from sync; falls back to the netbird default /16)
-		nbCIDR := networkCIDR
-		if nbCIDR == "" {
-			nbCIDR = "100.121.0.0/16"
-		}
-		prepended = append(prepended, map[string]any{
-			"ip_cidr":  []string{nbCIDR},
-			"outbound": "nb-out",
-		})
-		// Domain-specific route rules for each custom domain
-		for _, d := range customDomains {
+		// Custom domains → nb-out via the local domain rule-set (domains live
+		// in the file, updated at runtime by the engine; see customRuleSetTag).
+		// Idempotent: skip when an existing rule (cleaned) or a just-prepended
+		// one already references the set.
+		if ruleSetPath != "" && !hasRuleSetRule(prepended, customRuleSetTag) && !hasRuleSetRule(cleaned, customRuleSetTag) {
 			prepended = append(prepended, map[string]any{
-				"domain_suffix": strings.TrimSuffix(d, "."),
-				"outbound":      "nb-out",
+				"rule_set":  customRuleSetTag,
+				"outbound": "nb-out",
+			})
+		}
+		// Overlay CIDR → nb-out via the local CIDR rule-set (real-time updates
+		// for accounts whose overlay differs from the default /16). The overlay
+		// routing used to be a static ip_cidr rule baked into the config — it
+		// was removed: the CIDR now lives in nb-cidr.json (written at StartAll
+		// with the persisted/default value, refreshed by the engine after sync),
+		// so the route rule-set reference covers it with zero startup ordering
+		// dependency.
+		if cidrRuleSetPath != "" && !hasRuleSetRule(prepended, customCIDRRuleSetTag) && !hasRuleSetRule(cleaned, customCIDRRuleSetTag) {
+			prepended = append(prepended, map[string]any{
+				"rule_set":  customCIDRRuleSetTag,
+				"outbound": "nb-out",
+			})
+		}
+		// nb-cidr rule-set declaration — userspace only (kernel mode routes
+		// the overlay via the kernel route, no route rules at all).
+		// format 必须显式: 1.14 的 ruleSetDefaultFormat 用 url.Parse 推断
+		// 扩展名, Windows 盘符路径(C:\...)被当成 URL scheme → 推断失败 →
+		// "missing format"(Android /data/... 路径正常)。显式 source 全平台稳。
+		if cidrRuleSetPath != "" && !hasRuleSetDecl(routeSection, customCIDRRuleSetTag) {
+			ruleSets, _ := routeSection["rule_set"].([]any)
+			routeSection["rule_set"] = append(ruleSets, map[string]any{
+				"type":   "local",
+				"tag":    customCIDRRuleSetTag,
+				"path":   cidrRuleSetPath,
+				"format": "source",
 			})
 		}
 	}
 	routeSection["rules"] = append(prepended, cleaned...)
 
-	// Domain-specific DNS rules for each custom domain
-	for _, d := range customDomains {
-		clean := strings.TrimSuffix(d, ".")
-		rules, _ := dnsSection["rules"].([]any)
-		rules = append(rules, map[string]any{
-			"domain_suffix": clean,
-			"server":        "nb",
+	// Local rule-set declaration (nb-domains): route AND DNS rules resolve
+	// rule-set tags through the route.rule_set registry (box.go:
+	// router.Initialize(routeOptions.RuleSet)). Declared in both modes — the
+	// DNS custom-domain rule needs it in kernel mode too. format 显式, 理由
+	// 同上(Windows 路径推断失败)。
+	if ruleSetPath != "" && !hasRuleSetDecl(routeSection, customRuleSetTag) {
+		ruleSets, _ := routeSection["rule_set"].([]any)
+		routeSection["rule_set"] = append(ruleSets, map[string]any{
+			"type":   "local",
+			"tag":    customRuleSetTag,
+			"path":   ruleSetPath,
+			"format": "source",
 		})
-		dnsSection["rules"] = rules
 	}
+
+	// Custom domains → nb DNS transport (both kernel-TUN and userspace: the
+	// kernel route handles overlay IPs, but domain resolution still needs the
+	// tunnel DNS). References ONLY the domain rule-set (an IP-bearing set
+	// referenced by a DNS rule is rejected by the 1.14 legacy-address-filter
+	// check).
+	if ruleSetPath != "" {
+		dnsRules, _ := dnsSection["rules"].([]any)
+		if !hasRuleSetRule(dnsRules, customRuleSetTag) {
+			dnsSection["rules"] = append(dnsRules, map[string]any{
+				"rule_set": customRuleSetTag,
+				"server":   "nb",
+			})
+		}
+	}
+
+	// 注意: 不做 final=nb 兜底。兜底会让所有未命中规则的域名(非 CN 冷门
+	// 域名、rule_set 异步加载期间的域名)先走隧道 DNS —— 引擎在但隧道
+	// 不通时一次解析 5s 超时 + fallback 5s, 直接卡死。自定义域名靠上面的
+	// customDomains 显式规则(引擎 sync 成功后注入), 不影响其他域名。
+	// final 保持用户 profile 原样(通常 dns-remote 走代理, 快)。
 
 	return json.Marshal(raw)
 }
@@ -198,22 +264,64 @@ func hasServerTag(items []any, tag string) bool {
 	return false
 }
 
-// hasProcessPathRule reports whether rules already contain a process_path rule
-// matching exe (case-insensitive — Windows paths are case-insensitive).
-func hasProcessPathRule(rules []any, exe string) bool {
+// hasRuleSetDecl reports whether the route.rule_set section already declares
+// a rule-set with the given tag.
+func hasRuleSetDecl(routeSection map[string]any, tag string) bool {
+	ruleSets, _ := routeSection["rule_set"].([]any)
+	for _, rs := range ruleSets {
+		m, ok := rs.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fmt.Sprint(m["tag"]) == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRuleSetRule reports whether the rule list already contains a rule whose
+// rule_set matcher references the given tag (route and DNS rules both use
+// the same `rule_set` key; the value is a Listable string or array).
+func hasRuleSetRule(rules []any, tag string) bool {
+	for _, r := range rules {
+		m, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch v := m["rule_set"].(type) {
+		case string:
+			if v == tag {
+				return true
+			}
+		case []any:
+			for _, s := range v {
+				if fmt.Sprint(s) == tag {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hasIPDirectRule reports whether rules already contain an ip_cidr rule with
+// outbound "direct" covering all of the given IPs.
+func hasIPDirectRule(rules []any, ips []string) bool {
 	for _, r := range rules {
 		rule, ok := r.(map[string]any)
 		if !ok {
 			continue
 		}
-		pp, ok := rule["process_path"].([]any)
+		if fmt.Sprint(rule["outbound"]) != "direct" {
+			continue
+		}
+		cidrs, ok := rule["ip_cidr"].([]any)
 		if !ok {
 			continue
 		}
-		for _, p := range pp {
-			if strings.EqualFold(fmt.Sprint(p), exe) {
-				return true
-			}
+		if containsAll(cidrs, ips) {
+			return true
 		}
 	}
 	return false

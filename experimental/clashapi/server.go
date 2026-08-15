@@ -139,6 +139,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 
 		s.setupMetaAPI(r)
 		r.Mount("/monitor", monitor.HTTPHandler())
+		if h := netbirdRouter(); h != nil {
+			r.Mount("/netbird", h)
+		}
 	})
 	if options.ExternalUI != "" {
 		s.externalUI = filemanager.BasePath(ctx, os.ExpandEnv(options.ExternalUI))

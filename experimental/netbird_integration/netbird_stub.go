@@ -45,6 +45,7 @@ func ReadUnifiedConfig(path string) (*UnifiedConfig, error) { return nil, nil }
 type StartAllResult struct {
 	ModifiedConfig []byte
 	Engine         *Engine
+	EngineErr      string
 }
 
 // StartAll is a no-op stub when netbird is not compiled in.

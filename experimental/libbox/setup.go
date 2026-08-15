@@ -152,9 +152,18 @@ func SingBoxCommit() string {
 	return ""
 }
 
-// SingBoxBuildTime returns the VCS commit time (RFC3339) of the sing-box
-// build, or "" when no build info is embedded.
+// singBoxBuildTime is the real build time (RFC3339) injected via ldflags
+// -X (see dev.sh / rebuild-libbox.sh). When empty, SingBoxBuildTime falls
+// back to the VCS commit time embedded by Go.
+var singBoxBuildTime = ""
+
+// SingBoxBuildTime returns the actual build time (RFC3339) when injected
+// at build time; otherwise the VCS commit time of the sing-box build, or
+// "" when no build info is embedded.
 func SingBoxBuildTime() string {
+	if singBoxBuildTime != "" {
+		return singBoxBuildTime
+	}
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		return ""
